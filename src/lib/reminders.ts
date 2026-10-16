@@ -1,6 +1,9 @@
 import { supabase, isTaskScheduledForToday, getDueTodos, claimTodoReminder } from "./supabase";
 import { sendTelegramMessage, InlineKeyboard } from "./telegram";
 import { localDateString, localHHMMSS, todoDueLabel } from "./time";
+import { buildTodayScorecard } from "./scorecard";
+
+const MORNING_BRIEFING_TIME = process.env.MORNING_BRIEFING_TIME || "05:00:00";
 
 // DB-backed dedupe (works across serverless invocations): a unique row in
 // wizard_sessions acts as a lock so a reminder is sent at most once per day.
@@ -48,6 +51,25 @@ export async function sendDueReminders(
     return { status: "no_target_chat", count: 0, tasks: [], todos: [], time };
   }
 
+  const sentTasks: string[] = [];
+
+  // 5:00 AM Daily Morning Briefing
+  // Fires automatically at 05:00:00 (or on the first tick between 05:00:00 and 12:00:00 if idle)
+  const isMorningWindow = time >= MORNING_BRIEFING_TIME && time < "12:00:00";
+  if (isMorningWindow) {
+    const canSendMorning = await claimReminderSend("__morning_briefing__", localDateString(), "5am");
+    if (canSendMorning) {
+      try {
+        const scorecard = await buildTodayScorecard(targetChatId);
+        const morningMessage = `☀️ <b>Good Morning! (5:00 AM Daily Plan)</b>\n\n${scorecard}`;
+        await sendTelegramMessage(targetChatId, morningMessage);
+        sentTasks.push("Morning 5 AM Briefing");
+      } catch (err: any) {
+        console.error("Error sending 5 AM morning briefing:", err);
+      }
+    }
+  }
+
   const { data: dueTasks, error } = await supabase
     .from("tasks")
     .select("*")
@@ -58,8 +80,6 @@ export async function sendDueReminders(
     console.error("Error querying reminders:", error);
     return { status: "error", count: 0, tasks: [], todos: [], time };
   }
-
-  const sentTasks: string[] = [];
 
   for (const task of dueTasks || []) {
     if (!isTaskScheduledForToday(task.target_days)) continue;

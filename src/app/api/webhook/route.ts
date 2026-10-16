@@ -73,6 +73,7 @@ import { buildTimerView, formatDuration, NUDGE_INTERVAL_MS } from "@/lib/timerRu
 import { computeWastedDays, formatTimerMinutes, shiftDateString } from "@/lib/timeAudit";
 import { localDateLabel, localTimeString, localDateString, localDateShort, localWeekday, zonedDateTimeToUtc, todoDueLabel } from "@/lib/time";
 import { TaskType, Task, WizardSession, Todo } from "@/lib/types";
+import { buildTodayScorecard, formatReminderTime, formatGoalDisplay, formatFocusBadge } from "@/lib/scorecard";
 
 export const dynamic = "force-dynamic";
 
@@ -318,35 +319,6 @@ function parseSignedCountAmount(input: string): number | null {
   return negative ? -parsed.value : parsed.value;
 }
 
-// Format "HH:MM:SS" to readable "08:00 AM"
-function formatReminderTime(timeStr?: string | null): string {
-  if (!timeStr) return "None";
-  const parts = timeStr.split(":");
-  if (parts.length >= 2) {
-    let hours = parseInt(parts[0], 10);
-    const minutes = parts[1];
-    const ampm = hours >= 12 ? "PM" : "AM";
-    hours = hours % 12;
-    if (hours === 0) hours = 12;
-    return `${String(hours).padStart(2, "0")}:${minutes} ${ampm}`;
-  }
-  return timeStr;
-}
-
-// Format goal display (e.g. "2 hours" or "1h 30m" or "10 km" or "5,000 ml")
-function formatGoalDisplay(targetValue?: number | null, unit?: string | null): string {
-  if (!targetValue) return "None";
-  const cleanUnit = unit?.includes("|") ? unit.split("|")[0] : unit;
-
-  if (cleanUnit === "minutes") {
-    return formatTimerMinutes(targetValue);
-  }
-  if (cleanUnit === "status") {
-    return "1 completion";
-  }
-  return `${targetValue.toLocaleString()} ${cleanUnit || "units"}`;
-}
-
 // Task detail view (used by /tasks and as the reply target for typed amounts)
 async function buildTaskDetail(task: Task): Promise<{ text: string; keyboard: InlineKeyboard }> {
   if (task.type === "timer") {
@@ -471,12 +443,6 @@ function buildFocusKeyboard(logId: string, selected?: string | null): InlineKeyb
       { text: selected === "distracted" ? "✅ 😵 Distracted" : "😵 Distracted", callback_data: `set_focus:${logId}:distracted` },
     ],
   ];
-}
-
-function formatFocusBadge(totals: { focused: number; casual: number; distracted: number; tagged: number }): string {
-  if (!totals.tagged) return "";
-  const pct = (v: number) => Math.round((v / totals.tagged) * 100);
-  return ` [🎯 ${pct(totals.focused)}% · 😐 ${pct(totals.casual)}% · 😵 ${pct(totals.distracted)}%]`;
 }
 
 const FOCUS_QUESTION = "\n\n<b>How was this session?</b>";
@@ -934,78 +900,6 @@ async function buildTaskListButtons(
     }
   }
   return buttons;
-}
-
-// Build a clean, unbloated Today Scorecard
-async function buildTodayScorecard(chatId: string | number): Promise<string> {
-  const todayStr = localDateLabel();
-
-  const tasks = await getActiveTasks();
-  let text = `📊 <b>Today's Scorecard</b> — ${todayStr}\n\n`;
-
-  if (tasks.length === 0) {
-    text += `<i>No tasks created yet. Type /addtask to create one!</i>\n`;
-  } else {
-    text += `<b>Habits & Routines:</b>\n`;
-    for (const t of tasks) {
-      const isScheduledToday = isTaskScheduledForToday(t.target_days);
-      const scheduleTag = !isScheduledToday ? ` <i>(Off today: ${formatScheduleDisplay(t.target_days)})</i>` : "";
-
-      if (t.type === "tick") {
-        const isDone = await isTaskCompletedToday(t.id);
-        text += `${isDone ? "✅" : isScheduledToday ? "📌" : "💤"} <b>${t.name}</b> ${isDone ? "<i>(Done)</i>" : isScheduledToday ? "<i>(Pending)</i>" : scheduleTag}\n`;
-      } else if (t.type === "timer") {
-        const mins = await getTodayTaskTotal(t.name);
-        const target = t.target_value || 60;
-        const pct = Math.min(100, Math.round((mins / target) * 100));
-        const focusBadge = formatFocusBadge(await getTodayTaskFocus(t.name));
-        text += `${taskEmoji(t)} <b>${t.name}:</b> ${formatTimerMinutes(mins)} / ${formatGoalDisplay(target, "minutes")} (${pct}%)${focusBadge}${scheduleTag}\n`;
-      } else {
-        const val = await getTodayTaskTotal(t.name);
-        const target = t.target_value || 5000;
-        const pct = Math.min(100, Math.round((val / target) * 100));
-        const focusBadge = formatFocusBadge(await getTodayTaskFocus(t.name));
-        text += `💧 <b>${t.name}:</b> ${val.toLocaleString()} / ${formatGoalDisplay(target, t.unit)} (${pct}%)${focusBadge}${scheduleTag}\n`;
-      }
-    }
-  }
-
-  const today = localDateString();
-  const logs = await getLogsInRange(shiftDateString(today, -1), today);
-
-  // Wasted = elapsed (midnight -> now) - tracked timer sessions (Sleep included).
-  // A running session counts live; a missed night counts as wasted (no estimates).
-  if (tasks.length > 0) {
-    const active = await getActiveTimer(chatId);
-    const pause = await getPauseState(chatId);
-    const running = active
-      ? {
-          taskName: active.task_name,
-          startedAtMs: new Date(active.started_at).getTime(),
-          pausedAtMs: pause.pausedAt,
-          pausedSeconds: pause.pausedSeconds,
-        }
-      : null;
-
-    const [day] = computeWastedDays({ dates: [today], logs, tasks, running });
-    if (day) {
-      const sleepLabel = day.tracked ? `😴 ${formatTimerMinutes(day.sleepMin)}` : "😴 not tracked";
-
-      text += `\n🕳️ <b>Wasted:</b> ${formatTimerMinutes(day.wastedMin)} of ${formatTimerMinutes(day.elapsedMin)} <i>(${sleepLabel} · ⏱️ ${formatTimerMinutes(day.taskMin)} tasks)</i>\n`;
-    }
-  }
-
-  const diaryLogs = logs.filter((l) => l.task_name === "Diary" && l.log_date === today);
-  if (diaryLogs.length > 0) {
-    text += `\n📖 <b>Today's Diary:</b>\n`;
-    for (const d of diaryLogs) {
-      const timeStr = d.created_at ? localTimeString(new Date(d.created_at)) : "";
-      const moodBadge = d.mood ? `[${formatMoodDisplay(d.mood)}] ` : "";
-      text += `• ${timeStr ? `<i>[${timeStr}]</i> ` : ""}${moodBadge}${d.summary || d.notes}\n`;
-    }
-  }
-
-  return text;
 }
 
 // =========================================================================
